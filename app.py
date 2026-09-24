@@ -39,7 +39,8 @@ LOCK = threading.RLock()
 JOBS = {}
 ANALYSES = {}
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-COOKIES = os.environ.get('BILI_COOKIES')
+DEFAULT_COOKIES = Path.home() / '.config' / 'bilibili-panel' / 'cookies.txt'
+COOKIES = os.environ.get('BILI_COOKIES') or (str(DEFAULT_COOKIES) if DEFAULT_COOKIES.is_file() else None)
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
