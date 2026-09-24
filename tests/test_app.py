@@ -3,6 +3,7 @@ from unittest.mock import patch
 import tempfile
 from pathlib import Path
 import app
+from urllib.error import HTTPError
 
 class PanelTests(unittest.TestCase):
     def test_urls(self):
@@ -11,6 +12,40 @@ class PanelTests(unittest.TestCase):
     def test_rejected_urls(self):
         for url in ['http://127.0.0.1/video/av1','https://bilibili.com.evil.org/video/av1','file:///etc/passwd','https://u@www.bilibili.com/video/av1','https://www.bilibili.com:999/video/av1','https://www.bilibili.com/video/av1?p=-1']:
             with self.subTest(url=url),self.assertRaises(ValueError):app.normalize_url(url)
+    def test_episode_urls(self):
+        expected = 'https://www.bilibili.com/bangumi/play/ep775939'
+        for value in ['ep775939', expected, expected + '/?from=share',
+                      'https://m.bilibili.com/bangumi/play/ep775939']:
+            with self.subTest(value=value):
+                self.assertEqual(app.normalize_url(value), expected)
+    def test_episode_short_link(self):
+        target = 'https://www.bilibili.com/bangumi/play/ep775939'
+        with patch('app.build_opener') as opener:
+            opener.return_value.open.side_effect = HTTPError('https://b23.tv/ep775939', 302, '', {'Location': target}, None)
+            self.assertEqual(app.normalize_url('https://b23.tv/ep775939'), target)
+    def test_short_link_rejects_external_redirect(self):
+        with patch('app.build_opener') as opener:
+            opener.return_value.open.side_effect = HTTPError('https://b23.tv/test', 302, '', {'Location': 'http://127.0.0.1/private'}, None)
+            with self.assertRaises(ValueError):
+                app.normalize_url('https://b23.tv/test')
+    def test_rejected_episode_urls(self):
+        for value in ['https://www.bilibili.com/bangumi/play/ss123',
+                      'https://www.bilibili.com/bangumi/play/ep0',
+                      'https://www.bilibili.com/bangumi/play/ep775939/extra',
+                      'https://www.bilibili.com.evil.org/bangumi/play/ep775939']:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                app.normalize_url(value)
+    def test_episode_warning_and_title(self):
+        info = {'id': '775939', 'episode_id': '775939', 'title': '1', 'series': '测试剧集',
+                'formats': [{'format_id': '30011', 'vcodec': 'hevc', 'acodec': 'none'}]}
+        with patch('app.yt_dlp.YoutubeDL') as y:
+            def extract(*args, **kwargs):
+                y.call_args.args[0]['logger'].warning('Only preview format is available')
+                return info
+            y.return_value.__enter__.return_value.extract_info.side_effect = extract
+            result = app.analyze('https://www.bilibili.com/bangumi/play/ep775939')
+        self.assertEqual(result['title'], '测试剧集 · 1 · ep775939')
+        self.assertEqual(result['warnings'], ['Only preview format is available'])
     def test_formats(self):
         info={'title':'test','formats':[{'format_id':'30280','vcodec':'none'},{'format_id':'100026','vcodec':'avc1','acodec':'none'},{'format_id':'18','vcodec':'avc1','acodec':'aac'}]}
         with patch('app.yt_dlp.YoutubeDL') as y:

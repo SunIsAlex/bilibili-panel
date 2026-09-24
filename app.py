@@ -47,17 +47,20 @@ class NoRedirect(HTTPRedirectHandler):
 
 def normalize_url(value):
     value = str(value).strip()
-    if re.fullmatch(r'(BV[0-9A-Za-z]{10}|av\d+)', value):
+    if re.fullmatch(r'ep[1-9]\d*', value):
+        value = 'https://www.bilibili.com/bangumi/play/' + value
+    elif re.fullmatch(r'(BV[0-9A-Za-z]{10}|av\d+)', value):
         value = 'https://www.bilibili.com/video/' + value
     u = urlsplit(value)
     if u.scheme not in ('http', 'https') or u.username or u.password or u.port not in (None, 80, 443):
-        raise ValueError('请输入有效的 Bilibili 视频链接或 BV / av 号')
+        raise ValueError('请输入有效的 Bilibili 视频链接或 BV / av / ep 号')
     if u.hostname == 'b23.tv':
         if not re.fullmatch(r'/[A-Za-z0-9]+/?', u.path):
             raise ValueError('无效的短链接')
         try:
             build_opener(NoRedirect).open(Request('https://b23.tv' + u.path), timeout=15).close()
         except HTTPError as e:
+            e.close()
             if e.code not in (301, 302, 303, 307, 308):
                 raise ValueError('短链接解析失败') from e
             target = e.headers.get('Location', '')
@@ -67,17 +70,23 @@ def normalize_url(value):
         raise ValueError('短链接未返回视频地址')
     if u.hostname not in ('www.bilibili.com', 'm.bilibili.com', 'bilibili.com'):
         raise ValueError('仅支持 bilibili.com 视频和 b23.tv 短链接')
+    episode = re.fullmatch(r'/bangumi/play/(ep[1-9]\d*)/?', u.path)
+    if episode:
+        return f'https://www.bilibili.com/bangumi/play/{episode[1]}'
     match = re.fullmatch(r'/video/(BV[0-9A-Za-z]{10}|av\d+)/?', u.path)
     if not match:
-        raise ValueError('目前支持 /video/BV… 或 /video/av… 普通视频链接')
+        raise ValueError('支持 BV / av 普通视频与 /bangumi/play/ep… 单集链接；请勿使用整季或直播链接')
     p = parse_qs(u.query).get('p', ['1'])[0]
     if not p.isdigit() or not 1 <= int(p) <= 10000:
         raise ValueError('分 P 参数无效')
     return f'https://www.bilibili.com/video/{match[1]}?' + urlencode({'p': int(p)})
 
 class QuietLogger:
+    def __init__(self):
+        self.warnings = []
     def debug(self, msg): pass
-    def warning(self, msg): pass
+    def warning(self, msg):
+        self.warnings.append(clean_error(msg))
     def error(self, msg): pass
 
 def options():
@@ -88,10 +97,11 @@ def options():
     return result
 
 def analyze(url):
-    with yt_dlp.YoutubeDL(options()) as ydl:
+    opts = options()
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if not info or info.get('_type') in ('playlist', 'multi_video'):
-        raise ValueError('请使用单个视频或带 p 参数的分 P 链接')
+        raise ValueError('请使用单个视频、带 p 参数的分 P 链接或 ep 单集链接')
     formats = []
     selectors = {}
     for f in reversed(info.get('formats', [])):
@@ -109,8 +119,13 @@ def analyze(url):
     if not formats:
         raise ValueError('没有可下载的视频流；该视频可能需要登录或相应权限')
     aid = secrets.token_hex(16)
-    result = dict(id=aid, title=info.get('title'), uploader=info.get('uploader'),
-                  duration=info.get('duration'), thumbnail=info.get('thumbnail'), formats=formats)
+    title = info.get('title') or info.get('id')
+    if info.get('episode_id'):
+        title = ' · '.join(str(part) for part in (info.get('series') or info.get('season'),
+                                                title, 'ep' + info['episode_id']) if part)
+    result = dict(id=aid, title=title, uploader=info.get('uploader') or info.get('series'),
+                  duration=info.get('duration'), thumbnail=info.get('thumbnail'), formats=formats,
+                  warnings=opts['logger'].warnings)
     with LOCK:
         now = time.time()
         for old in list(ANALYSES):
