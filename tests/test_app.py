@@ -8,6 +8,45 @@ import json
 from urllib.error import HTTPError
 
 class PanelTests(unittest.TestCase):
+    def test_subtitle_catalog_excludes_danmaku(self):
+        tracks = app.subtitle_tracks({'subtitles': {
+            'danmaku': [{'ext': 'xml'}], 'zh-Hans': [{'ext': 'srt', 'data': 'text'}],
+            'en': [{'ext': 'vtt', 'name': 'English'}], 'unknown': [{'ext': 'json'}]}})
+        self.assertEqual([t['language'] for t in tracks], ['zh-Hans', 'en'])
+        self.assertEqual(tracks[1]['name'], 'English')
+    def test_subtitle_only_download(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'DOWNLOADS', Path(tmp)), patch('app.yt_dlp.YoutubeDL') as y:
+            app.JOBS['subs'] = {'status': 'queued'}
+            def fake(*args, **kwargs):
+                f = Path(tmp) / 'subs' / 'video.zh-Hans.srt'
+                f.write_text('1\n00:00:00,000 --> 00:00:01,000\n字幕\n')
+                return {'requested_subtitles': {'zh-Hans': {'filepath': str(f)}}}
+            y.return_value.__enter__.return_value.extract_info.side_effect = fake
+            app.download('subs', 'https://www.bilibili.com/video/av1', None, ['zh-Hans'])
+            self.assertTrue(y.call_args.args[0]['skip_download'])
+            self.assertEqual(app.JOBS['subs']['status'], 'done')
+            self.assertEqual(app.JOBS['subs']['subtitle_files'][0]['language'], 'zh-Hans')
+            self.assertNotIn('filename', app.JOBS['subs'])
+    def test_missing_selected_subtitle_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'DOWNLOADS', Path(tmp)), patch('app.yt_dlp.YoutubeDL') as y:
+            app.JOBS['missing-sub'] = {'status': 'queued'}
+            y.return_value.__enter__.return_value.extract_info.return_value = {'requested_subtitles': {}}
+            app.download('missing-sub', 'https://www.bilibili.com/video/av1', None, ['en'])
+            self.assertEqual(app.JOBS['missing-sub']['status'], 'error')
+    def test_video_with_subtitles(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'DOWNLOADS', Path(tmp)), patch('app.yt_dlp.YoutubeDL') as y:
+            app.JOBS['both'] = {'status': 'queued'}
+            def fake(*args, **kwargs):
+                folder = Path(tmp) / 'both'
+                (folder / 'video.mkv').write_bytes(b'video')
+                f = folder / 'video.en.srt'
+                f.write_text('subtitle')
+                return {'requested_subtitles': {'en': {'filepath': str(f)}}}
+            y.return_value.__enter__.return_value.extract_info.side_effect = fake
+            app.download('both', 'https://www.bilibili.com/video/av1', '18', ['en'])
+            self.assertEqual(app.JOBS['both']['status'], 'done')
+            self.assertEqual(app.JOBS['both']['filename'], 'video.mkv')
+            self.assertEqual(len(app.JOBS['both']['subtitle_files']), 1)
     def test_share_text(self):
         self.assertEqual(app.normalize_url('【电影分享】https://www.bilibili.com/bangumi/play/ep810659'),
                          'https://www.bilibili.com/bangumi/play/ep810659')

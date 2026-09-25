@@ -403,3 +403,19 @@ node --check static/app.js
 当单集的 `extract_info()` 抛出 `DownloadError` 时，`episode_failure_reason()` 复用该 yt-dlp 实例及其 Cookie，查询官方 `/pgc/player/web/v2/playurl` 接口。若 `video_info.is_drm` 为真，则返回明确的 DRM 不支持提示；如果诊断请求失败或没有确认 DRM，则保留原始解析异常。该逻辑只诊断失败原因，不请求解密密钥、许可证，也不绕过 DRM。
 
 新增 4 项测试覆盖分享文案、DRM 提示、诊断失败保留原错误，以及非 DRM 情况保留原错误；测试总数现为 14 项。
+
+## 14. 字幕下载实现补充
+
+解析阶段启用 `writesubtitles`，读取 yt-dlp 的 `subtitles` 字典；`subtitle_tracks()` 将可用语言、名称、格式返回给前端并保存在解析记录中，排除弹幕 XML 和未支持的格式。Bilibili extractor 负责把其 JSON 字幕转换为 SRT。格式优先级为 `srt/vtt/ass/ssa`。
+
+`POST /api/download` 新增可选字段 `mode`（`video` 或 `subtitles`）以及 `subtitles`（语言字符串数组）。服务端将所选语言与解析结果逐一比对，再使用 `re.escape()` 传给 yt-dlp，避免把语言代码当作任意正则表达式。默认仍为不带字幕的视频下载，兼容原有请求。
+
+```json
+{"id":"<解析ID>","mode":"subtitles","subtitles":["zh-Hans"]}
+```
+
+字幕任务同样受线程池和队列上限约束。仅字幕模式使用 `skip_download=True`，不要求 FFmpeg，也不下载视频媒体；但仍会重新解析视频和字幕。视频加字幕模式传入画质 key，并启用 `writesubtitles=True`。两种模式都检查 `requested_subtitles` 的实际文件路径，要求文件位于当前任务目录且扩展名受支持。字幕失效或未成功写入时，任务明确失败，可能留下已下载的文件。
+
+完成状态包含 `subtitle_files` 数组，每项记录随机文件 ID、语言、文件名和大小。浏览器通过 `/api/files/<任务ID>?subtitle=<字幕文件ID>` 获取文件；接口只按任务已登记的文件 ID 查找，不接受客户端提交文件路径。仅字幕任务没有视频 `filename`，前端只显示字幕保存入口。
+
+字幕保持独立，不写入 MKV、不烧录、不做 OCR；DRM 视频仍受现有解析限制。任务目录创建已移入异常捕获范围，目录创建失败也会进入 error 状态。新增四项字幕测试后，自动测试总数为 18 项。

@@ -51,10 +51,20 @@ async function refresh() {
       const detail = j.status === 'error' ? j.error : j.status === 'done' ? size(j.size) : j.status === 'merging' ? '正在准备或合并音视频…' : `当前流 ${j.progress || 0}%${j.speed ? ' · ' + size(j.speed) + '/s' : ''}${j.eta != null ? ' · 约 ' + j.eta + ' 秒' : ''}`;
       const body = row.querySelector('.job-body');
       body.replaceChildren(top, track, el('div', 'detail', detail));
+      if (j.mode === 'subtitles') body.append(el('div', 'task-mode', '仅字幕'));
       if (j.status === 'done') {
-        const a = el('a', 'save', '保存文件 ↓');
-        a.href = '/api/files/' + j.id;
-        body.append(a);
+        if (j.filename) {
+          const a = el('a', 'save', '保存视频 ↓');
+          a.href = '/api/files/' + j.id;
+          body.append(a);
+        }
+        const subtitles = el('div', 'subtitle-files');
+        for (const f of j.subtitle_files || []) {
+          const a = el('a', 'save save-subtitle', `${f.language} · ${f.filename.split('.').pop().toUpperCase()} ↓`);
+          a.href = '/api/files/' + j.id + '?subtitle=' + encodeURIComponent(f.id);
+          subtitles.append(a);
+        }
+        body.append(subtitles);
       }
       if ($('jobs').children[index] !== row) $('jobs').insertBefore(row, $('jobs').children[index] || null);
     }
@@ -63,6 +73,39 @@ async function refresh() {
     $('health').textContent = '○ 无法连接服务，请检查后端';
   }
 }
-$('form').addEventListener('submit',async e=>{e.preventDefault();error('');$('analyze').disabled=true;$('analyze').textContent='正在解析…';$('preview').hidden=true;analysis=null;try{if(!token)await refresh();analysis=await api('/api/analyze',{url:$('url').value});$('title').textContent=analysis.title;$('warnings').textContent=(analysis.warnings||[]).join('；');$('warnings').hidden=!analysis.warnings?.length;$('meta').textContent=`${analysis.uploader||'未知 UP 主'} · ${Math.floor((analysis.duration||0)/60)} 分 ${Math.round((analysis.duration||0)%60)} 秒`;$('formats').replaceChildren();for(const f of analysis.formats){const o=document.createElement('option');o.value=f.key;o.textContent=`${f.note||(f.height?f.height+'p':'原画')} · ${f.codec||f.ext||'视频'}${f.fps?' · '+f.fps+' fps':''} · ${size(f.size)}`;$('formats').append(o);}$('preview').hidden=false;}catch(e){error(e.message);}finally{$('analyze').disabled=false;$('analyze').textContent='解析视频 ↗';}});
-$('download').addEventListener('click',async()=>{if(!analysis)return;error('');$('download').disabled=true;try{await api('/api/download',{id:analysis.id,format:$('formats').value});await refresh();$('jobs').scrollIntoView({behavior:'smooth',block:'nearest'});}catch(e){error(e.message);}finally{$('download').disabled=false;}});
+$('form').addEventListener('submit',async e=>{e.preventDefault();error('');$('analyze').disabled=true;$('analyze').textContent='正在解析…';$('preview').hidden=true;analysis=null;try{if(!token)await refresh();analysis=await api('/api/analyze',{url:$('url').value});$('title').textContent=analysis.title;$('warnings').textContent=(analysis.warnings||[]).join('；');$('warnings').hidden=!analysis.warnings?.length;$('meta').textContent=`${analysis.uploader||'未知 UP 主'} · ${Math.floor((analysis.duration||0)/60)} 分 ${Math.round((analysis.duration||0)%60)} 秒`;$('formats').replaceChildren();for(const f of analysis.formats){const o=document.createElement('option');o.value=f.key;o.textContent=`${f.note||(f.height?f.height+'p':'原画')} · ${f.codec||f.ext||'视频'}${f.fps?' · '+f.fps+' fps':''} · ${size(f.size)}`;$('formats').append(o);}renderSubtitles(analysis.subtitles || []);$('preview').hidden=false;}catch(e){error(e.message);}finally{$('analyze').disabled=false;$('analyze').textContent='解析视频 ↗';}});
+function selectedSubtitles() {
+  return [...$('subtitle-options').querySelectorAll('input:checked')].map(input => input.value);
+}
+function renderSubtitles(tracks) {
+  $('subtitle-options').replaceChildren();
+  for (const track of tracks) {
+    const label = el('label', 'subtitle-choice');
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.value = track.language;
+    input.addEventListener('change', () => { $('download-subtitles').disabled = !selectedSubtitles().length; });
+    label.append(input, el('span', '', `${track.name} · ${track.formats.join(' / ').toUpperCase()}`));
+    $('subtitle-options').append(label);
+  }
+  $('subtitle-hint').textContent = tracks.length ? '勾选后可随视频保存，也可仅下载字幕；字幕为独立文件。' : '未发现可下载的外挂字幕。画面内嵌字幕无法直接提取，部分字幕需要登录。';
+  $('download-subtitles').disabled = true;
+}
+async function enqueue(mode) {
+  if (!analysis) return;
+  error('');
+  $('download').disabled = true;
+  $('download-subtitles').disabled = true;
+  try {
+    await api('/api/download', {id:analysis.id, format:$('formats').value, mode, subtitles:selectedSubtitles()});
+    await refresh();
+    $('jobs').scrollIntoView({behavior:'smooth',block:'nearest'});
+  } catch(e) { error(e.message); }
+  finally {
+    $('download').disabled = false;
+    $('download-subtitles').disabled = !selectedSubtitles().length;
+  }
+}
+$('download').addEventListener('click', () => enqueue('video'));
+$('download-subtitles').addEventListener('click', () => enqueue('subtitles'));
 async function poll(){await refresh();setTimeout(poll,1500);}poll();

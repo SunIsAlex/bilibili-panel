@@ -122,8 +122,16 @@ def episode_failure_reason(ydl, url):
         return None
     return None
 
+SUBTITLE_EXTENSIONS = {'srt', 'vtt', 'ass', 'ssa'}
+
+def subtitle_tracks(info):
+    return [dict(language=lang, name=next((f.get('name') for f in tracks if f.get('name')), lang),
+                 formats=sorted({f['ext'] for f in tracks if f.get('ext') in SUBTITLE_EXTENSIONS}))
+            for lang, tracks in (info.get('subtitles') or {}).items()
+            if lang != 'danmaku' and any(f.get('ext') in SUBTITLE_EXTENSIONS for f in tracks)]
+
 def analyze(url):
-    opts = options()
+    opts = options() | dict(writesubtitles=True, subtitleslangs=['all', '-danmaku'], subtitlesformat='srt/vtt/ass/ssa')
     with yt_dlp.YoutubeDL(opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
@@ -157,7 +165,7 @@ def analyze(url):
                                                 title, 'ep' + info['episode_id']) if part)
     result = dict(id=aid, title=title, uploader=info.get('uploader') or info.get('series'),
                   duration=info.get('duration'), thumbnail=info.get('thumbnail'), formats=formats,
-                  warnings=opts['logger'].warnings)
+                  warnings=opts['logger'].warnings, subtitles=subtitle_tracks(info))
     with LOCK:
         now = time.time()
         for old in list(ANALYSES):
@@ -165,16 +173,16 @@ def analyze(url):
                 del ANALYSES[old]
         if len(ANALYSES) >= 100:
             del ANALYSES[next(iter(ANALYSES))]
-        ANALYSES[aid] = dict(url=url, selectors=selectors, title=result['title'], thumbnail=result['thumbnail'], time=now)
+        ANALYSES[aid] = dict(url=url, selectors=selectors, title=result['title'], thumbnail=result['thumbnail'], subtitles=result['subtitles'], time=now)
     return result
 
 def update(jid, **data):
     with LOCK:
         JOBS[jid].update(data)
 
-def download(jid, url, selector):
+def download(jid, url, selector, languages=None):
+    languages = languages or []
     folder = DOWNLOADS / jid
-    folder.mkdir()
     def progress(d):
         total = d.get('total_bytes') or d.get('total_bytes_estimate')
         update(jid, status='merging' if d['status'] == 'finished' else 'downloading',
@@ -182,14 +190,33 @@ def download(jid, url, selector):
                speed=d.get('speed'), eta=d.get('eta'))
     opts = options() | dict(format=selector, outtmpl=str(folder / '%(title).120B [%(id)s].%(ext)s'),
                             merge_output_format='mkv', progress_hooks=[progress])
+    if languages:
+        opts.update(writesubtitles=True, subtitleslangs=[re.escape(lang) for lang in languages],
+                    subtitlesformat='srt/vtt/ass/ssa')
+    if selector is None:
+        opts.pop('format', None)
+        opts['skip_download'] = True
     try:
+        folder.mkdir()
         update(jid, status='downloading')
         with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.extract_info(url, download=True)
+            info = ydl.extract_info(url, download=True)
+        subtitle_files = []
+        for lang in languages:
+            sub = ((info or {}).get('requested_subtitles') or {}).get(lang) or {}
+            file = Path(sub.get('filepath') or '')
+            if not file.is_file() or file.resolve().parent != folder.resolve() or file.suffix.lstrip('.') not in SUBTITLE_EXTENSIONS:
+                raise ValueError(f'字幕 {lang} 未成功保存，可能已不可用，请重新解析')
+            subtitle_files.append(dict(id=secrets.token_hex(8), language=lang, filename=file.name, size=file.stat().st_size))
+        if selector is None:
+            if not subtitle_files:
+                raise ValueError('未找到可下载的字幕')
+            update(jid, status='done', progress=100, subtitle_files=subtitle_files, size=sum(f['size'] for f in subtitle_files))
+            return
         files = [p for p in folder.iterdir() if p.suffix in ('.mkv', '.mp4', '.flv', '.webm') and not re.search(r'\.f[\w-]+\.', p.name)]
         if len(files) != 1:
             raise ValueError('未找到完整的合并文件')
-        update(jid, status='done', progress=100, filename=files[0].name, size=files[0].stat().st_size)
+        update(jid, status='done', progress=100, filename=files[0].name, size=files[0].stat().st_size, subtitle_files=subtitle_files)
     except Exception as e:
         update(jid, status='error', error=clean_error(e))
 
@@ -225,7 +252,15 @@ class Handler(BaseHTTPRequestHandler):
                 job = JOBS.get(jid, {}).copy()
             if job.get('status') != 'done':
                 return self.json({'error': '文件不存在'}, 404)
-            file = DOWNLOADS / jid / job['filename']
+            subtitle_id = parse_qs(urlsplit(self.path).query).get('subtitle', [None])[0]
+            if subtitle_id is not None:
+                selected = next((f for f in job.get('subtitle_files', []) if f['id'] == subtitle_id), {})
+                filename = selected.get('filename')
+            else:
+                filename = job.get('filename')
+            if not filename:
+                return self.json({'error': '文件不存在'}, 404)
+            file = DOWNLOADS / jid / filename
             if not file.is_file():
                 return self.json({'error': '文件已移除'}, 404)
             self.send_response(200)
@@ -256,20 +291,30 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/api/analyze':
                 return self.json(analyze(normalize_url(data.get('url', ''))))
             if self.path == '/api/download':
-                if not media_ready():
+                mode = data.get('mode', 'video')
+                if mode not in ('video', 'subtitles'):
+                    raise ValueError('无效的下载模式')
+                if mode == 'video' and not media_ready():
                     raise ValueError('FFmpeg / ffprobe 不可运行，请检查安装及动态库环境后重启服务')
                 with LOCK:
                     analysis = ANALYSES.get(str(data.get('id')))
                     if not analysis or time.time() - analysis['time'] > 1800:
                         raise ValueError('解析结果已过期，请重新解析')
                     selector = analysis['selectors'].get(str(data.get('format')))
-                    if not selector:
+                    if mode == 'video' and not selector:
                         raise ValueError('请选择有效的画质')
+                    languages = data.get('subtitles', [])
+                    allowed = {s['language'] for s in analysis.get('subtitles', [])}
+                    if not isinstance(languages, list) or any(not isinstance(lang, str) or lang not in allowed for lang in languages):
+                        raise ValueError('请选择有效的字幕语言')
+                    languages = list(dict.fromkeys(languages))
+                    if mode == 'subtitles' and not languages:
+                        raise ValueError('请至少选择一种字幕语言')
                     if sum(j['status'] not in ('done', 'error') for j in JOBS.values()) >= 10:
                         raise ValueError('下载队列已满，请稍后重试')
                     jid = secrets.token_hex(12)
-                    JOBS[jid] = dict(id=jid, title=analysis['title'], thumbnail=analysis.get('thumbnail'), status='queued', progress=0)
-                    POOL.submit(download, jid, analysis['url'], selector)
+                    JOBS[jid] = dict(id=jid, title=analysis['title'], thumbnail=analysis.get('thumbnail'), mode=mode, status='queued', progress=0)
+                    POOL.submit(download, jid, analysis['url'], selector if mode == 'video' else None, languages)
                 return self.json({'id': jid}, 202)
             return self.json({'error': '未找到'}, 404)
         except (ValueError, yt_dlp.utils.DownloadError) as e:
