@@ -3,9 +3,39 @@ from unittest.mock import patch
 import tempfile
 from pathlib import Path
 import app
+import io
+import json
 from urllib.error import HTTPError
 
 class PanelTests(unittest.TestCase):
+    def test_share_text(self):
+        self.assertEqual(app.normalize_url('【电影分享】https://www.bilibili.com/bangumi/play/ep810659'),
+                         'https://www.bilibili.com/bangumi/play/ep810659')
+        self.assertEqual(app.normalize_url('看看这个 https://www.bilibili.com/video/av170001?p=2。'),
+                         'https://www.bilibili.com/video/av170001?p=2')
+        with self.assertRaises(ValueError):
+            app.normalize_url('https://b23.tv/one https://b23.tv/two')
+    def test_episode_drm_error(self):
+        with patch('app.yt_dlp.YoutubeDL') as y:
+            instance = y.return_value.__enter__.return_value
+            instance.extract_info.side_effect = app.yt_dlp.utils.DownloadError('No video formats found')
+            instance.urlopen.return_value = io.BytesIO(json.dumps({'result': {'video_info': {'is_drm': True}}}).encode())
+            with self.assertRaisesRegex(ValueError, 'DRM'):
+                app.analyze('https://www.bilibili.com/bangumi/play/ep810659')
+    def test_episode_diagnostic_failure_preserves_error(self):
+        with patch('app.yt_dlp.YoutubeDL') as y:
+            instance = y.return_value.__enter__.return_value
+            instance.extract_info.side_effect = app.yt_dlp.utils.DownloadError('original error')
+            instance.urlopen.side_effect = OSError('diagnostic failed')
+            with self.assertRaisesRegex(app.yt_dlp.utils.DownloadError, 'original error'):
+                app.analyze('https://www.bilibili.com/bangumi/play/ep810659')
+    def test_non_drm_preserves_error(self):
+        with patch('app.yt_dlp.YoutubeDL') as y:
+            instance = y.return_value.__enter__.return_value
+            instance.extract_info.side_effect = app.yt_dlp.utils.DownloadError('original error')
+            instance.urlopen.return_value = io.BytesIO(b'{"result":{"video_info":{"is_drm":false}}}')
+            with self.assertRaisesRegex(app.yt_dlp.utils.DownloadError, 'original error'):
+                app.analyze('https://www.bilibili.com/bangumi/play/ep810659')
     def test_urls(self):
         self.assertEqual(app.normalize_url('BV1xx411c7mD'),'https://www.bilibili.com/video/BV1xx411c7mD?p=1')
         self.assertEqual(app.normalize_url('https://www.bilibili.com/video/av170001?p=2&x=y'),'https://www.bilibili.com/video/av170001?p=2')

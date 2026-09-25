@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, parse_qs, urlencode, quote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError
 import yt_dlp
+from yt_dlp.networking import Request as YtdlpRequest
 
 ROOT = Path(__file__).resolve().parent
 DOWNLOADS = ROOT / 'downloads'
@@ -48,6 +49,11 @@ class NoRedirect(HTTPRedirectHandler):
 
 def normalize_url(value):
     value = str(value).strip()
+    links = re.findall(r'https?://[^\s<>"【】]+', value)
+    if len(links) > 1:
+        raise ValueError('请一次只提交一个视频链接')
+    if links:
+        value = links[0].rstrip('。，！？、）)]}》」』')
     if re.fullmatch(r'ep[1-9]\d*', value):
         value = 'https://www.bilibili.com/bangumi/play/' + value
     elif re.fullmatch(r'(BV[0-9A-Za-z]{10}|av\d+)', value):
@@ -97,10 +103,35 @@ def options():
         result['cookiefile'] = COOKIES
     return result
 
+def episode_failure_reason(ydl, url):
+    """Diagnose failed episode extraction without requesting DRM keys or licenses."""
+    match = re.fullmatch(r'https://www\.bilibili\.com/bangumi/play/ep([1-9]\d*)', url)
+    if not match:
+        return None
+    endpoint = 'https://api.bilibili.com/pgc/player/web/v2/playurl?' + urlencode(
+        {'ep_id': match[1], 'fnval': 12240})
+    try:
+        with ydl.urlopen(YtdlpRequest(endpoint, headers={'Referer': url})) as response:
+            payload = json.loads(response.read())
+        data = payload.get('result') or payload.get('data') or {}
+        video = data.get('video_info') or {}
+        if video.get('is_drm') in (True, 1, '1'):
+            return '该电影或剧集使用 DRM 加密保护，当前面板不支持下载为普通视频文件。请使用哔哩哔哩官方客户端播放。'
+    except Exception:
+        # A diagnostic failure must not hide the original extraction error.
+        return None
+    return None
+
 def analyze(url):
     opts = options()
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+        try:
+            info = ydl.extract_info(url, download=False)
+        except yt_dlp.utils.DownloadError as e:
+            reason = episode_failure_reason(ydl, url)
+            if reason:
+                raise ValueError(reason) from e
+            raise
     if not info or info.get('_type') in ('playlist', 'multi_video'):
         raise ValueError('请使用单个视频、带 p 参数的分 P 链接或 ep 单集链接')
     formats = []
