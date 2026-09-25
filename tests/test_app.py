@@ -8,6 +8,40 @@ import json
 from urllib.error import HTTPError
 
 class PanelTests(unittest.TestCase):
+    def test_collection_url(self):
+        self.assertEqual(app.normalize_url('https://space.bilibili.com/123/lists/456'),
+                         'https://space.bilibili.com/123/lists/456?type=season')
+        self.assertEqual(app.normalize_url('https://space.bilibili.com/123/channel/collectiondetail?sid=456'),
+                         'https://space.bilibili.com/123/lists/456?type=season')
+        for url in ['https://space.bilibili.com/123/lists/456?type=series',
+                    'https://space.bilibili.com/123/lists/abc',
+                    'https://space.bilibili.com.evil.org/123/lists/456']:
+            with self.subTest(url=url), self.assertRaises(ValueError): app.normalize_url(url)
+    def test_collection_from_member_video(self):
+        data = {'ugc_season': {'id': 456, 'mid': 123, 'title': '合集', 'ep_count': 2,
+                'sections': [{'episodes': [{'bvid': 'BV1xx411c7mD', 'title': '第一集'},
+                                          {'bvid': 'BV17x411w7KC', 'title': '第二集'}]}]}}
+        with patch('app.collection_api', return_value=data):
+            result = app.analyze_collection('https://www.bilibili.com/video/BV1xx411c7mD?p=1')
+        self.assertEqual(result['total'], 2)
+        self.assertEqual(result['entries'][0]['title'], '第一集')
+    def test_collection_pagination(self):
+        pages = [{'page': {'total': 2}, 'meta': {'name': '分页合集'}, 'archives': [{'bvid': 'BV1xx411c7mD', 'title': '第一集', 'pic': 'https://example.com/cover.jpg'}]},
+                 {'page': {'total': 2}, 'archives': [{'bvid': 'BV17x411w7KC', 'title': '第二集'}]}]
+        with patch('app.collection_api', side_effect=pages):
+            result = app.analyze_collection('https://space.bilibili.com/123/lists/456?type=season')
+        self.assertEqual(result['total'], 2)
+        self.assertEqual(result['entries'][0]['thumbnail'], 'https://example.com/cover.jpg')
+    def test_collection_incomplete_rejected(self):
+        data = {'page': {'total': 2}, 'archives': [{'bvid': 'BV1xx411c7mD'}]}
+        with patch('app.collection_api', return_value=data), self.assertRaisesRegex(ValueError, '不完整'):
+            app.analyze_collection('https://space.bilibili.com/123/lists/456?type=season')
+    def test_collection_limit(self):
+        with patch('app.collection_api', return_value={'page': {'total': 201}}), self.assertRaisesRegex(ValueError, '超过'):
+            app.analyze_collection('https://space.bilibili.com/123/lists/456?type=season')
+    def test_video_without_collection(self):
+        with patch('app.collection_api', return_value={}), self.assertRaisesRegex(ValueError, '没有可识别'):
+            app.analyze_collection('https://www.bilibili.com/video/BV1xx411c7mD?p=1')
     def test_subtitle_catalog_excludes_danmaku(self):
         tracks = app.subtitle_tracks({'subtitles': {
             'danmaku': [{'ext': 'xml'}], 'zh-Hans': [{'ext': 'srt', 'data': 'text'}],

@@ -71,12 +71,25 @@ def normalize_url(value):
             if e.code not in (301, 302, 303, 307, 308):
                 raise ValueError('短链接解析失败') from e
             target = e.headers.get('Location', '')
-            if urlsplit(target).hostname not in ('www.bilibili.com', 'm.bilibili.com', 'bilibili.com'):
+            if urlsplit(target).hostname not in ('www.bilibili.com', 'm.bilibili.com', 'bilibili.com', 'space.bilibili.com'):
                 raise ValueError('短链接未指向 Bilibili 视频')
             return normalize_url(target)
         raise ValueError('短链接未返回视频地址')
-    if u.hostname not in ('www.bilibili.com', 'm.bilibili.com', 'bilibili.com'):
+    if u.hostname not in ('www.bilibili.com', 'm.bilibili.com', 'bilibili.com', 'space.bilibili.com'):
         raise ValueError('仅支持 bilibili.com 视频和 b23.tv 短链接')
+    if u.hostname == 'space.bilibili.com':
+        collection = re.fullmatch(r'/([1-9]\d*)/lists/([1-9]\d*)/?', u.path)
+        legacy = re.fullmatch(r'/([1-9]\d*)/channel/collectiondetail/?', u.path)
+        query = parse_qs(u.query)
+        if query.get('type', ['season'])[0] != 'season':
+            raise ValueError('目前支持 UP 主合集，不支持 series 播放列表')
+        if collection:
+            mid, sid = collection.groups()
+        elif legacy and re.fullmatch(r'[1-9]\d*', query.get('sid', [''])[0]):
+            mid, sid = legacy[1], query['sid'][0]
+        else:
+            raise ValueError('无效的合集链接')
+        return f'https://space.bilibili.com/{mid}/lists/{sid}?type=season'
     episode = re.fullmatch(r'/bangumi/play/(ep[1-9]\d*)/?', u.path)
     if episode:
         return f'https://www.bilibili.com/bangumi/play/{episode[1]}'
@@ -171,10 +184,79 @@ def analyze(url):
         for old in list(ANALYSES):
             if now - ANALYSES[old]['time'] > 1800:
                 del ANALYSES[old]
-        if len(ANALYSES) >= 100:
+        if len(ANALYSES) >= 300:
             del ANALYSES[next(iter(ANALYSES))]
         ANALYSES[aid] = dict(url=url, selectors=selectors, title=result['title'], thumbnail=result['thumbnail'], subtitles=result['subtitles'], time=now)
     return result
+
+MAX_COLLECTION_ENTRIES = 200
+
+def collection_api(ydl, endpoint, query):
+    url = 'https://api.bilibili.com/' + endpoint + '?' + urlencode(query)
+    with ydl.urlopen(YtdlpRequest(url, headers={'Referer': 'https://www.bilibili.com/'})) as response:
+        payload = json.loads(response.read())
+    if payload.get('code') != 0:
+        raise ValueError('合集接口请求失败：' + str(payload.get('message') or payload.get('code')))
+    return payload.get('data') or {}
+
+def collection_entries(items):
+    result, seen = [], set()
+    for item in items:
+        bvid = item.get('bvid') or (item.get('arc') or {}).get('bvid')
+        if not isinstance(bvid, str) or not re.fullmatch(r'BV[0-9A-Za-z]{10}', bvid) or bvid in seen:
+            continue
+        seen.add(bvid)
+        arc = item.get('arc') or item
+        result.append(dict(id=bvid, bvid=bvid, title=item.get('title') or arc.get('title') or bvid,
+                           url=f'https://www.bilibili.com/video/{bvid}?p=1',
+                           thumbnail=arc.get('pic') or arc.get('thumbnail'), duration=arc.get('duration')))
+    return result
+
+def analyze_collection(url):
+    """List a UGC collection without extracting every video's media formats."""
+    direct = re.fullmatch(r'https://space\.bilibili\.com/(\d+)/lists/(\d+)\?type=season', url)
+    with yt_dlp.YoutubeDL(options()) as ydl:
+        if direct:
+            mid, sid = direct.groups()
+        else:
+            video = re.fullmatch(r'https://www\.bilibili\.com/video/(BV[0-9A-Za-z]{10}|av\d+)\?p=\d+', url)
+            if not video:
+                raise ValueError('请输入 UP 主合集链接，或合集内的视频链接；番剧整季暂不支持')
+            key = 'bvid' if video[1].startswith('BV') else 'aid'
+            data = collection_api(ydl, 'x/web-interface/view', {key: video[1] if key == 'bvid' else video[1][2:]})
+            season = data.get('ugc_season') or {}
+            mid = season.get('mid') or (data.get('owner') or {}).get('mid')
+            sid = season.get('id') or data.get('season_id')
+            if not mid or not sid:
+                raise ValueError('该视频没有可识别的 UP 主合集，请使用“解析视频”')
+            expected = int(season.get('ep_count') or 0)
+            if expected > MAX_COLLECTION_ENTRIES:
+                raise ValueError(f'合集超过 {MAX_COLLECTION_ENTRIES} 个视频，请拆分处理')
+            entries = collection_entries([ep for section in season.get('sections', []) for ep in section.get('episodes', [])])
+            if entries and len(entries) == expected:
+                return dict(id=str(sid), title=season.get('title') or '视频合集', thumbnail=season.get('cover'),
+                            entries=entries, total=len(entries))
+        if not str(mid).isdigit() or not str(sid).isdigit():
+            raise ValueError('合集标识无效')
+        entries, meta, total = [], {}, None
+        for page in range(1, MAX_COLLECTION_ENTRIES + 1):
+            data = collection_api(ydl, 'x/polymer/web-space/seasons_archives_list',
+                                  dict(mid=mid, season_id=sid, page_num=page, page_size=30))
+            total = int((data.get('page') or {}).get('total') or 0)
+            if total > MAX_COLLECTION_ENTRIES:
+                raise ValueError(f'合集超过 {MAX_COLLECTION_ENTRIES} 个视频，请拆分处理')
+            meta = data.get('meta') or meta
+            batch = data.get('archives') or []
+            if not batch:
+                break
+            previous = len(entries)
+            entries = collection_entries(entries + batch)
+            if len(entries) >= total or len(entries) == previous:
+                break
+        if not entries or len(entries) != total:
+            raise ValueError('合集目录不完整或暂无可访问视频，请稍后重试')
+        return dict(id=str(sid), title=meta.get('name') or '视频合集', thumbnail=meta.get('cover'),
+                    entries=entries, total=len(entries))
 
 def update(jid, **data):
     with LOCK:
@@ -288,6 +370,8 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(length))
             if not isinstance(data, dict):
                 raise ValueError('请求格式无效')
+            if self.path == '/api/collection':
+                return self.json(analyze_collection(normalize_url(data.get('url', ''))))
             if self.path == '/api/analyze':
                 return self.json(analyze(normalize_url(data.get('url', ''))))
             if self.path == '/api/download':
