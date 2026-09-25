@@ -134,7 +134,7 @@ def analyze(url):
                 del ANALYSES[old]
         if len(ANALYSES) >= 100:
             del ANALYSES[next(iter(ANALYSES))]
-        ANALYSES[aid] = dict(url=url, selectors=selectors, title=result['title'], time=now)
+        ANALYSES[aid] = dict(url=url, selectors=selectors, title=result['title'], thumbnail=result['thumbnail'], time=now)
     return result
 
 def update(jid, **data):
@@ -237,7 +237,7 @@ class Handler(BaseHTTPRequestHandler):
                     if sum(j['status'] not in ('done', 'error') for j in JOBS.values()) >= 10:
                         raise ValueError('下载队列已满，请稍后重试')
                     jid = secrets.token_hex(12)
-                    JOBS[jid] = dict(id=jid, title=analysis['title'], status='queued', progress=0)
+                    JOBS[jid] = dict(id=jid, title=analysis['title'], thumbnail=analysis.get('thumbnail'), status='queued', progress=0)
                     POOL.submit(download, jid, analysis['url'], selector)
                 return self.json({'id': jid}, 202)
             return self.json({'error': '未找到'}, 404)
