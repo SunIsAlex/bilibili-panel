@@ -116,6 +116,31 @@ def options():
         result['cookiefile'] = COOKIES
     return result
 
+def test_cookie_validity():
+    if not COOKIES:
+        return dict(configured=False, login=False, vip=False,
+                    message='未配置 Cookie；当前以访客模式访问。')
+    if not Path(COOKIES).is_file():
+        return dict(configured=True, login=False, vip=False,
+                    message='Cookie 文件不存在，请检查配置路径。')
+    try:
+        with yt_dlp.YoutubeDL(options() | dict(socket_timeout=10, retries=0)) as ydl:
+            request = YtdlpRequest('https://api.bilibili.com/x/web-interface/nav',
+                                   headers={'Referer': 'https://www.bilibili.com/'})
+            with ydl.urlopen(request) as response:
+                result = json.loads(response.read())
+        data = result.get('data') or {}
+        login = bool(data.get('isLogin')) if result.get('code') == 0 else False
+        vip = login and data.get('vipStatus') == 1
+        if login:
+            message = 'Cookie 有效，Bilibili 已识别登录状态。' + ('账号有大会员权限。' if vip else '账号当前没有大会员权限。')
+        else:
+            message = 'Bilibili 未识别登录状态；Cookie 可能已过期或失效。'
+        return dict(configured=True, login=login, vip=vip, message=message)
+    except Exception as e:
+        return dict(configured=True, login=None, vip=False,
+                    message='Cookie 状态检查失败：' + clean_error(e))
+
 def episode_failure_reason(ydl, url):
     """Diagnose failed episode extraction without requesting DRM keys or licenses."""
     match = re.fullmatch(r'https://www\.bilibili\.com/bangumi/play/ep([1-9]\d*)', url)
@@ -372,6 +397,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('请求格式无效')
             if self.path == '/api/collection':
                 return self.json(analyze_collection(normalize_url(data.get('url', ''))))
+            if self.path == '/api/cookies/test':
+                return self.json(test_cookie_validity())
             if self.path == '/api/analyze':
                 return self.json(analyze(normalize_url(data.get('url', ''))))
             if self.path == '/api/download':

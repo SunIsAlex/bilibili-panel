@@ -207,3 +207,16 @@ $('collection-parse').addEventListener('click', async () => {
     $('collection-progress').textContent = `${stopBatch ? '已停止' : '解析完成'} · ${completed}/${selected.length} · 成功 ${completed - failed} · 失败 ${failed}`;
   }
 });
+
+$('test-cookies').addEventListener('click', async () => {
+  const button = $('test-cookies'), status = $('cookie-status'), container = button.parentElement;
+  button.disabled = true; button.textContent = '正在检查…';
+  status.textContent = '正在向 Bilibili 验证登录状态'; container.dataset.state = 'checking';
+  try {
+    const result = await api('/api/cookies/test', {});
+    status.textContent = result.message;
+    container.dataset.state = result.login === true ? 'valid' : result.login === false ? 'invalid' : 'unknown';
+  } catch(e) {
+    status.textContent = e.message; container.dataset.state = 'unknown';
+  } finally { button.disabled = false; button.textContent = '测试 Cookie'; }
+});
